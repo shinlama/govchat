@@ -1,0 +1,7 @@
+streamlit
+sentence-transformers
+qdrant-client
+pandas
+sentence-transformers
+openai
+uuid

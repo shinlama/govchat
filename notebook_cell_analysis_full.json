@@ -1,0 +1,196 @@
+{
+  "notebook": "making_vectordb_ko-sroberta-multitask.ipynb",
+  "cells": [
+    {
+      "index": 1,
+      "cell_type": "markdown",
+      "source": "필요한 라이브러리 설치",
+      "preview": "필요한 라이브러리 설치",
+      "analysis": null
+    },
+    {
+      "index": 2,
+      "cell_type": "code",
+      "source": "!pip install qdrant-client sentence-transformers pandas rich",
+      "analysis": {
+        "imports": [],
+        "from_imports": [],
+        "functions": [],
+        "classes": [],
+        "keywords": [
+          "qdrant",
+          "sentence",
+          "transformer",
+          "transformers",
+          "pandas"
+        ],
+        "parse_error": "invalid syntax (<unknown>, line 1)"
+      },
+      "preview": "!pip install qdrant-client sentence-transformers pandas rich"
+    },
+    {
+      "index": 3,
+      "cell_type": "markdown",
+      "source": "## 2단계: 데이터 로드 및 전처리",
+      "preview": "## 2단계: 데이터 로드 및 전처리",
+      "analysis": null
+    },
+    {
+      "index": 4,
+      "cell_type": "code",
+      "source": "import pandas as pd\nfrom tqdm.auto import tqdm\n\n# 1. CSV 파일 로드\n# Colab에 파일을 업로드한 후 파일 경로를 확인하세요.\nfile_path = 'gov24_services_with_tags (1).csv'\ndf = pd.read_csv(file_path)\n\n# 2. 벡터화를 위한 텍스트 생성\n# NaN(결측치) 값을 안전하게 처리하기 위해 fillna('')를 사용합니다.\ndf['combined_text'] = (\n    (df['서비스명'].fillna('') + \" \" + df['tags'].fillna('')) * 3 + # 중요 정보를 3번 반복\n    \" \" + df['지원내용'].fillna('')\n)\n\n# 3. 페이로드(Payload) 데이터 준비\n# 각 행을 dictionary 형태로 변환하여 리스트에 저장합니다.\n# 이렇게 하면 각 서비스의 모든 정보를 페이로드로 저장할 수 있습니다.\npayloads = df.to_dict(orient='records')\n\n# 4. 벡터화할 텍스트 리스트 준비\ndocuments = df['combined_text'].tolist()\n\nprint(f\"총 {len(documents)}개의 서비스를 처리합니다.\")\nprint(\"벡터화 예시 텍스트:\", documents[0])",
+      "analysis": {
+        "imports": [
+          "pandas"
+        ],
+        "from_imports": [
+          {
+            "module": "tqdm.auto",
+            "names": [
+              "tqdm"
+            ]
+          }
+        ],
+        "functions": [],
+        "classes": [],
+        "keywords": [
+          "pandas",
+          "pd.read"
+        ],
+        "parse_error": null
+      },
+      "preview": "import pandas as pd"
+    },
+    {
+      "index": 5,
+      "cell_type": "markdown",
+      "source": "## 3단계: 모델 및 Qdrant 클라이언트 준비",
+      "preview": "## 3단계: 모델 및 Qdrant 클라이언트 준비",
+      "analysis": null
+    },
+    {
+      "index": 6,
+      "cell_type": "code",
+      "source": "from sentence_transformers import SentenceTransformer\nfrom qdrant_client import QdrantClient, models\n\n# 1. 한국어 특화 임베딩 모델 로드\nmodel = SentenceTransformer('jhgan/ko-sroberta-multitask')\n\n# 모델의 벡터 차원 확인 (ko-sroberta-multitask는 768)\nvector_size = model.get_sentence_embedding_dimension()\nprint(f\"사용할 모델의 벡터 차원: {vector_size}\")\n\n# 2. Qdrant 클라이언트 초기화 (In-memory storage)\nclient = QdrantClient(\":memory:\")\n\n# 3. Qdrant 컬렉션 생성\ncollection_name = \"gov_services\"\nclient.recreate_collection(\n    collection_name=collection_name,\n    vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE)\n)\nprint(f\"'{collection_name}' 컬렉션 생성 완료!\")",
+      "analysis": {
+        "imports": [],
+        "from_imports": [
+          {
+            "module": "sentence_transformers",
+            "names": [
+              "SentenceTransformer"
+            ]
+          },
+          {
+            "module": "qdrant_client",
+            "names": [
+              "QdrantClient",
+              "models"
+            ]
+          }
+        ],
+        "functions": [],
+        "classes": [],
+        "keywords": [
+          "qdrant",
+          "vector",
+          "embedding",
+          "sroberta",
+          "ko-sroberta",
+          "sentence",
+          "transformer",
+          "transformers",
+          "rag",
+          "bert"
+        ],
+        "parse_error": null
+      },
+      "preview": "from sentence_transformers import SentenceTransformer"
+    },
+    {
+      "index": 7,
+      "cell_type": "markdown",
+      "source": "## 4단계: 벡터 생성 및 Qdrant에 업로드",
+      "preview": "## 4단계: 벡터 생성 및 Qdrant에 업로드",
+      "analysis": null
+    },
+    {
+      "index": 8,
+      "cell_type": "code",
+      "source": "# 텍스트를 벡터로 변환 (시간이 다소 소요될 수 있습니다)\nprint(\"임베딩 생성 중...\")\nvectors = model.encode(documents, show_progress_bar=True)\n\n# Qdrant에 데이터 포인트 업로드\nprint(\"Qdrant에 데이터 업로드 중...\")\nclient.upload_points(\n    collection_name=collection_name,\n    points=[\n        models.PointStruct(\n            id=idx,\n            vector=vector.tolist(),\n            payload=payload\n        )\n        for idx, (vector, payload) in enumerate(zip(vectors, payloads))\n    ],\n    batch_size=256, # 한 번에 업로드할 데이터 수\n    wait=True\n)\n\nprint(\"업로드 완료!\")",
+      "analysis": {
+        "imports": [],
+        "from_imports": [],
+        "functions": [],
+        "classes": [],
+        "keywords": [
+          "qdrant",
+          "vector"
+        ],
+        "parse_error": null
+      },
+      "preview": "# 텍스트를 벡터로 변환 (시간이 다소 소요될 수 있습니다)"
+    },
+    {
+      "index": 9,
+      "cell_type": "markdown",
+      "source": "## 5단계: 의미 기반 검색 테스트",
+      "preview": "## 5단계: 의미 기반 검색 테스트",
+      "analysis": null
+    },
+    {
+      "index": 10,
+      "cell_type": "code",
+      "source": "from rich.console import Console\nfrom rich.table import Table\nimport re # 태그를 파싱하기 위해 정규식 라이브러리 import\n\ndef search_services(query_text, top_k=3):\n    \"\"\"(최종 개선) 필드별 가중치를 적용한 정교한 Reranking 검색 함수\"\"\"\n\n    # 1. Qdrant에서 후보군 넉넉하게 가져오기 (limit=10)\n    response = client.query_points(\n        collection_name=collection_name,\n        query=model.encode(query_text).tolist(),\n        limit=10\n    )\n    hits = response.points\n\n    # 2. 정교한 Reranking 수행\n    reranked_hits = []\n    query_keywords = query_text.split()\n\n    for hit in hits:\n        payload = hit.payload\n        bonus = 0\n\n        # --- 필드별 가중치 차등 적용 ---\n\n        # 1. Tags 필드: 가장 높은 가중치 (+0.5)\n        # \"노인,일자리,건강\" 형태의 태그 문자열을 리스트로 변환 -> ['노인', '일자리', '건강']\n        tags_text = str(payload.get('tags', ''))\n        # 쉼표, 공백, 세미콜론 등 다양한 구분자를 기준으로 태그를 분리합니다.\n        tag_list = [tag.strip() for tag in re.split(r'[,;\\s]\\s*', tags_text) if tag]\n\n        for keyword in query_keywords:\n            if keyword in tag_list:\n                bonus += 0.5  # 태그가 정확히 일치하면 큰 보너스!\n\n        # 2. 서비스명 필드: 중간 가중치 (+0.2)\n        service_name = str(payload.get('서비스명', ''))\n        for keyword in query_keywords:\n            if keyword in service_name:\n                bonus += 0.2\n\n        # 3. 지원내용 필드: 낮은 가중치 (+0.05)\n        support_content = str(payload.get('지원내용', ''))\n        for keyword in query_keywords:\n            if keyword in support_content:\n                bonus += 0.05\n\n        reranked_hits.append({'original_hit': hit, 'final_score': hit.score + bonus})\n\n    # 'final_score'가 높은 순으로 다시 정렬\n    reranked_hits.sort(key=lambda x: x['final_score'], reverse=True)\n\n    # 3. 최종 결과 출력\n    console = Console()\n    table = Table(title=f\"'{query_text}' 검색 결과 (Top {top_k})\")\n    table.add_column(\"Final Score\", style=\"cyan\")\n    table.add_column(\"Original Score\", style=\"dim cyan\")\n    table.add_column(\"서비스명\", style=\"magenta\")\n    table.add_column(\"Tags\", style=\"green\") # Tags를 직접 확인하기 위해 추가\n\n    for item in reranked_hits[:top_k]:\n        hit = item['original_hit']\n        payload = hit.payload\n        table.add_row(\n            f\"{item['final_score']:.4f}\",\n            f\"{hit.score:.4f}\",\n            str(payload.get('서비스명', 'N/A')),\n            str(payload.get('tags', 'N/A'))\n        )\n\n    console.print(table)\n\n\n# --- 검색 테스트 ---\nsearch_services(\"우리 아이 학비 지원해주는 정책 알려줘\")\nsearch_services(\"사업 시작하는데 자금이 부족해\")\nsearch_services(\"나이 많은 어르신들을 위한 일자리 없을까?\")",
+      "analysis": {
+        "imports": [
+          "re"
+        ],
+        "from_imports": [
+          {
+            "module": "rich.console",
+            "names": [
+              "Console"
+            ]
+          },
+          {
+            "module": "rich.table",
+            "names": [
+              "Table"
+            ]
+          }
+        ],
+        "functions": [
+          {
+            "name": "search_services",
+            "args": [
+              "query_text",
+              "top_k"
+            ],
+            "doc": "(최종 개선) 필드별 가중치를 적용한 정교한 Reranking 검색 함수"
+          }
+        ],
+        "classes": [],
+        "keywords": [
+          "qdrant"
+        ],
+        "parse_error": null
+      },
+      "preview": "from rich.console import Console"
+    },
+    {
+      "index": 11,
+      "cell_type": "code",
+      "source": "",
+      "analysis": {
+        "imports": [],
+        "from_imports": [],
+        "functions": [],
+        "classes": [],
+        "keywords": [],
+        "parse_error": null
+      },
+      "preview": ""
+    }
+  ]
+}
