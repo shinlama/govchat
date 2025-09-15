@@ -5,3 +5,8 @@ pandas
 sentence-transformers
 openai
 uuid
+faster-whisper
+streamlit-webrtc
+pydub
+soundfile
+numpy

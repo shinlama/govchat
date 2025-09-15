@@ -5,21 +5,25 @@ from qdrant_client.models import VectorParams, Distance, PointStruct
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 import uuid
+import tempfile
+import wave
+import numpy as np
+from faster_whisper import WhisperModel
+from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, RTCConfiguration, WebRtcMode
+import av
 
 # -----------------------------
 # 초기 세팅
 # -----------------------------
-st.set_page_config(page_title="Vector Search Chatbot with Qdrant", layout="wide")
-st.title("💬 정책 서비스 검색 챗봇")
+st.set_page_config(page_title="Vector Search Chatbot with Voice", layout="wide")
+st.title("💬 음성 입력 정책 서비스 검색 챗봇")
 
 # OpenAI API Key 입력
 openai_api_key = st.sidebar.text_input("🔑 OpenAI API Key", type="password")
 
-# 세션 상태 초기화
 if 'openai_api_key' not in st.session_state:
     st.session_state.openai_api_key = None
 
-# API 키가 입력되면 세션 상태에 저장
 if openai_api_key:
     st.session_state.openai_api_key = openai_api_key
 
@@ -36,10 +40,17 @@ def load_model():
 
 embedder = load_model()
 
+# Whisper 모델 로딩 (CPU 전용, int8 최적화)
+@st.cache_resource
+def load_stt_model():
+    return WhisperModel("small", device="cpu", compute_type="int8")
+
+stt_model = load_stt_model()
+
 # Qdrant client 연결
 qdrant_client = QdrantClient(host=qdrant_host, port=qdrant_port)
 
-# OpenAI 클라이언트 초기화 함수
+# OpenAI 클라이언트
 def get_openai_client():
     if st.session_state.openai_api_key:
         return OpenAI(api_key=st.session_state.openai_api_key)
@@ -57,23 +68,18 @@ if uploaded_file:
     st.write("데이터 미리보기:")
     st.dataframe(df.head())
 
-    # 텍스트 컬럼들 자동 감지
     text_columns = df.columns.tolist()
     main_col = st.selectbox("서비스명을 나타내는 컬럼 선택", text_columns)
     support_cols = st.multiselect("추가 정보를 담은 컬럼 선택", text_columns, default=[c for c in text_columns if c != main_col])
 
     if st.button("Qdrant에 업로드"):
-        # collection 새로 생성
         qdrant_client.recreate_collection(
             collection_name=collection_name,
             vectors_config=VectorParams(size=embedder.get_sentence_embedding_dimension(),
                                         distance=Distance.COSINE)
         )
-
-        # 데이터 업로드
         points = []
-        for idx, row in df.iterrows():
-            # 검색 임베딩용 텍스트 = 메인 + 추가 컬럼 합치기
+        for _, row in df.iterrows():
             concat_text = str(row[main_col])
             for c in support_cols:
                 concat_text += " " + str(row[c])
@@ -87,11 +93,53 @@ if uploaded_file:
 
 
 # -----------------------------
+# 음성 입력 → 텍스트 변환
+# -----------------------------
+st.header("🎙 음성 입력")
+
+class AudioProcessor(AudioProcessorBase):
+    def __init__(self) -> None:
+        self.audio_frames = []
+
+    def recv_audio(self, frame: av.AudioFrame) -> av.AudioFrame:
+        audio = frame.to_ndarray()
+        self.audio_frames.append(audio)
+        return frame
+
+rtc_configuration = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
+
+ctx = webrtc_streamer(
+    key="speech",
+    mode=WebRtcMode.SENDRECV,
+    media_stream_constraints={"audio": True, "video": False},
+)
+
+query_text = st.text_input("✍️ 직접 텍스트 입력", placeholder="예: 청년 주거 지원 받을 수 있는 제도 알려줘")
+
+if ctx.audio_processor:
+    if st.button("🎙 음성 변환 → 텍스트 입력"):
+        pcm_data = np.concatenate(ctx.audio_processor.audio_frames, axis=1).T
+        tmp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        with wave.open(tmp_wav.name, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(pcm_data.astype(np.int16).tobytes())
+
+        segments, _ = stt_model.transcribe(tmp_wav.name, beam_size=5)
+        recognized_text = " ".join([seg.text for seg in segments])
+
+        st.session_state["query_text"] = recognized_text
+        st.success("📝 인식된 텍스트: " + recognized_text)
+
+# -----------------------------
 # 의미 기반 검색 + GPT 요약
 # -----------------------------
 st.header("🔍 의미 기반 검색 & 요약 답변")
 
-query = st.text_input("검색어 입력", placeholder="예: 청년 주거 지원 받을 수 있는 제도 알려줘")
+query = st.session_state.get("query_text", query_text)
 top_k = st.slider("검색 결과 개수", 1, 10, 5)
 
 if st.button("검색 실행"):
@@ -104,7 +152,6 @@ if st.button("검색 실행"):
         if not results:
             st.error("검색 결과가 없습니다.")
         else:
-            # GPT 프롬프트 생성
             context_texts = []
             for r in results:
                 p = r.payload
@@ -132,7 +179,6 @@ if st.button("검색 실행"):
 최종 답변:
 """
 
-            # OpenAI 클라이언트 가져오기
             openai_client = get_openai_client()
             
             if openai_client:
