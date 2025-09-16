@@ -39,36 +39,24 @@ git clone https://github.com/shinlama/govchat.git
 cd govchat
 ```
 
-### 2. 가상환경 생성 및 활성화
 
-```bash
-# 가상환경 생성
-python -m venv venv
-
-# 가상환경 활성화 (macOS/Linux)
-source venv/bin/activate
-
-# 가상환경 활성화 (Windows)
-venv\Scripts\activate
-```
-
-### 3. 패키지 설치
+### 2. 패키지 설치
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Qdrant 벡터 데이터베이스 실행
+### 3. Qdrant 벡터 데이터베이스 실행
 
 ```bash
 # Docker로 Qdrant 실행
 docker run -p 6333:6333 qdrant/qdrant
+(그 전에 docker 설치 https://www.docker.com/products/docker-desktop/, 
+docker -v으로 설치 확인, 브라우저에서 http://localhost:6333/dashboard
+ 접속 → Qdrant Web UI가 나오면 성공)
 
-# 또는 Docker Compose 사용
-docker-compose up -d
-```
 
-### 5. 애플리케이션 실행
+### 4. 애플리케이션 실행
 
 ```bash
 streamlit run app.py
