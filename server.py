@@ -83,22 +83,25 @@ with tabs[0]:
                 if not ctx.audio_processor or not ctx.audio_processor.buffers:
                     st.warning("수집된 오디오가 없습니다. 마이크 녹음 상태를 확인해주세요.")
                 else:
+                    # 오디오 파일을 메모리 내에서 직접 처리
                     path = save_wav_from_buffers(ctx.audio_processor.buffers, sr=48000)
                     if not path:
                         st.warning("수집된 오디오가 없습니다. 마이크 녹음 상태를 확인해주세요.")
                     else:
                         with open(path, "rb") as f:
-                            files = {"audio": ("input.wav", f, "audio/wav")}
-                            data = {
-                                "engine": ENGINE,
-                                "language": LANG,
-                                "beam_size": int(BEAM),
-                                "topk": int(TOPK),
-                                "voice": VOICE,
-                            }
-                            t0 = time.time()
-                            res = requests.post(PIPELINE_URL, files=files, data=data, timeout=TIMEOUT)
-                            dt = time.time() - t0
+                            audio_bytes = f.read()
+                        
+                        files = {"audio": ("input.wav", audio_bytes, "audio/wav")}
+                        data = {
+                            "engine": ENGINE,
+                            "language": LANG,
+                            "beam_size": int(BEAM),
+                            "topk": int(TOPK),
+                            "voice": VOICE,
+                        }
+                        t0 = time.time()
+                        res = requests.post(PIPELINE_URL, files=files, data=data, timeout=TIMEOUT)
+                        dt = time.time() - t0
                         if res.ok:
                             st.session_state.last_json = res.json()
                             st.success(f"성공! (RTT {dt:.2f}s)")
