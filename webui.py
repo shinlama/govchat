@@ -4,6 +4,7 @@ import time
 import requests
 import numpy as np
 import streamlit as st
+import json
 
 # WebRTC로 마이크 녹음
 import av
@@ -39,7 +40,6 @@ class AudioProcessor(AudioProcessorBase):
         self.sr = 48000
 
     def recv_audio(self, frame: av.AudioFrame) -> av.AudioFrame:
-        # float32 PCM, shape = (channels, samples)
         self.buffers.append(frame.to_ndarray())
         return frame
 
@@ -83,22 +83,25 @@ with tabs[0]:
                 if not ctx.audio_processor or not ctx.audio_processor.buffers:
                     st.warning("수집된 오디오가 없습니다. 마이크 녹음 상태를 확인해주세요.")
                 else:
+                    # 오디오 파일을 메모리 내에서 직접 처리
                     path = save_wav_from_buffers(ctx.audio_processor.buffers, sr=48000)
                     if not path:
                         st.warning("수집된 오디오가 없습니다. 마이크 녹음 상태를 확인해주세요.")
                     else:
                         with open(path, "rb") as f:
-                            files = {"audio": ("input.wav", f, "audio/wav")}
-                            data = {
-                                "engine": ENGINE,
-                                "language": LANG,
-                                "beam_size": int(BEAM),
-                                "topk": int(TOPK),
-                                "voice": VOICE,
-                            }
-                            t0 = time.time()
-                            res = requests.post(PIPELINE_URL, files=files, data=data, timeout=TIMEOUT)
-                            dt = time.time() - t0
+                            audio_bytes = f.read()
+                        
+                        files = {"audio": ("input.wav", audio_bytes, "audio/wav")}
+                        data = {
+                            "engine": ENGINE,
+                            "language": LANG,
+                            "beam_size": int(BEAM),
+                            "topk": int(TOPK),
+                            "voice": VOICE,
+                        }
+                        t0 = time.time()
+                        res = requests.post(PIPELINE_URL, files=files, data=data, timeout=TIMEOUT)
+                        dt = time.time() - t0
                         if res.ok:
                             st.session_state.last_json = res.json()
                             st.success(f"성공! (RTT {dt:.2f}s)")
@@ -160,7 +163,19 @@ if st.session_state.last_json:
     st.write(js.get("stt", {}))
 
     st.markdown("### 🔎 검색 결과")
-    st.write(js.get("search", {}))
+    
+    search_results = js.get("search", {})
+    if search_results.get("results"):
+        cols = st.columns(3)
+        for i, result in enumerate(search_results["results"]):
+            with cols[i % 3]:
+                st.markdown(f"**{i+1}. {result.get('서비스명') or 'N/A'}**")
+                with st.expander("자세히 보기"):
+                    st.markdown(f"**지원내용:** {result.get('지원내용') or 'N/A'}")
+                    if result.get('tags'):
+                        st.markdown(f"**태그:** {result['tags']}")
+    else:
+        st.info("검색 결과가 없습니다.")
 
     st.markdown("### 🔊 합성 음성 (TTS)")
     tts = js.get("tts", {})

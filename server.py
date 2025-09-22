@@ -1,182 +1,238 @@
+import time
 import io
 import base64
-import time
-import requests
-import numpy as np
-import streamlit as st
+import os
+import re
+import asyncio
+import pandas as pd
+from tqdm.auto import tqdm
 
-# WebRTC로 마이크 녹음
-import av
-from scipy.io.wavfile import write
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
-st.set_page_config(page_title="통합 STT→정책검색→TTS", layout="centered")
-st.title("음성 복지정책 도우미 (통합 서버 테스트 UI)")
+from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient, models
 
-# -----------------------------
-# 사이드바: 서버/옵션
-# -----------------------------
-st.sidebar.header("서버 & 옵션")
-API_BASE = st.sidebar.text_input("API Base URL", "http://165.132.46.88:30984")
-ENGINE   = st.sidebar.selectbox("STT 엔진", ["fw", "ow"], index=0)
-LANG     = st.sidebar.text_input("언어", "ko")
-VOICE    = st.sidebar.selectbox("TTS 음성", ["ko-KR-SunHiNeural", "ko-KR-InJoonNeural"], index=0)
-TOPK     = st.sidebar.number_input("검색 TopK", min_value=1, max_value=10, value=3)
-BEAM     = st.sidebar.number_input("Faster-Whisper beam_size", min_value=1, max_value=10, value=5)
-TIMEOUT  = st.sidebar.number_input("요청 타임아웃(sec)", min_value=5, max_value=300, value=120)
+# ======================
+# 0) Settings
+# ======================
+POLICIES_PATH = "gov24_services_with_tags.csv"
+CSV_PATH_2 = "gov24_services_with_tags (1).csv"
+COLLECTION_NAME = "gov_services"
+MODEL_NAME = "BAAI/bge-m3"
+ENGINE_DEFAULT = "fw"
+LANGUAGE = "ko"
+FW_BEAM = 5
+MAX_READ = 3
+SUMMARY_CLIP = 300
+DEFAULT_VOICE = "ko-KR-SunHiNeural"
+CORS_ORIGINS = ["*"]
 
-PIPELINE_URL   = f"{API_BASE}/stt_search_tts"
-HEALTHZ_URL    = f"{API_BASE}/healthz"
+# ======================
+# 1) Services
+# ======================
+class PolicySearch:
+    def __init__(self, csv_path: str):
+        self.df = None
+        self.documents = None
+        self.payloads = None
+        self.model = None
+        self.client = None
+        
+        if os.path.exists(csv_path):
+            self.df, self.payloads, self.documents = self.load_and_prepare(csv_path)
+            self.model, self.client = self.build_index(self.documents, self.payloads)
+        elif os.path.exists(CSV_PATH_2):
+            self.df, self.payloads, self.documents = self.load_and_prepare(CSV_PATH_2)
+            self.model, self.client = self.build_index(self.documents, self.payloads)
+        else:
+            print(f"Error: Neither {csv_path} nor {CSV_PATH_2} were found.")
 
-st.caption("TIP: 먼저 백엔드 서버를 켜세요 → `uvicorn app.server:app --port 30984 --reload`")
+    def rows(self):
+        return len(self.df) if self.df is not None else 0
+        
+    def load_and_prepare(self, csv_path: str):
+        df = pd.read_csv(csv_path)
+        df["서비스명"] = df["서비스명"].fillna("")
+        df["tags"] = df["tags"].fillna("")
+        df["지원내용"] = df["지원내용"].fillna("")
+        df["combined_text"] = (df["서비스명"] + " " + df["tags"]) * 3 + " " + df["지원내용"]
+        payloads = df.to_dict(orient="records")
+        documents = df["combined_text"].tolist()
+        return df, payloads, documents
 
-# -----------------------------
-# WebRTC 오디오 수집 (마이크)
-# -----------------------------
-class AudioProcessor(AudioProcessorBase):
-    def __init__(self) -> None:
-        self.buffers = []
-        self.sr = 48000
+    def build_index(self, documents, payloads):
+        model = SentenceTransformer(MODEL_NAME)
+        dim = model.get_sentence_embedding_dimension()
+        client = QdrantClient(":memory:")
+        client.recreate_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
+        )
+        vectors = model.encode(documents, show_progress_bar=False)
+        client.upload_points(
+            collection_name=COLLECTION_NAME,
+            points=[
+                models.PointStruct(id=i, vector=v.tolist(), payload=p)
+                for i, (v, p) in enumerate(zip(vectors, payloads))
+            ],
+            batch_size=256,
+            wait=True,
+        )
+        return model, client
 
-    def recv_audio(self, frame: av.AudioFrame) -> av.AudioFrame:
-        # float32 PCM, shape = (channels, samples)
-        self.buffers.append(frame.to_ndarray())
-        return frame
+    def search(self, query_text: str, top_k: int = 3):
+        if not self.model or not self.client:
+            return []
+        
+        resp = self.client.query_points(
+            collection_name=COLLECTION_NAME,
+            query=self.model.encode(query_text).tolist(),
+            limit=10,
+        )
+        hits = resp.points
 
-def save_wav_from_buffers(buffers, sr=48000, path="tmp_input.wav"):
-    if not buffers:
-        return None
-    data = np.concatenate(buffers, axis=1)
-    if data.ndim == 2 and data.shape[0] > 1:
-        data = data.mean(axis=0, keepdims=True)  # stereo -> mono
-    data = (data.squeeze() * 32767).astype("int16")
-    write(path, sr, data)
-    return path
+        reranked = []
+        query_keywords = query_text.split()
 
-tabs = st.tabs(["🎙️ 마이크 녹음", "📁 파일 업로드"])
-
-# 상태 저장
-if "last_json" not in st.session_state:
-    st.session_state.last_json = None
-
-# -----------------------------
-# 탭 1: 마이크 녹음
-# -----------------------------
-with tabs[0]:
-    st.subheader("🎙️ 마이크 → /stt_search_tts")
-    st.markdown("1) **Start** 눌러 말하고 → 2) **🎧 현재 녹음분 전송**")
-
-    ctx = webrtc_streamer(
-        key="stt-pipeline",
-        mode=WebRtcMode.SENDONLY,
-        audio_receiver_size=1024,
-        media_stream_constraints={"audio": True, "video": False},
-        async_processing=False,
-        audio_processor_factory=AudioProcessor,
-    )
-
-    c1, c2 = st.columns(2)
-    with c1:
-        if ctx and ctx.state.playing and st.button("🎧 현재 녹음분 전송"):
-            try:
-                # 오디오 버퍼가 비어있는지 확인
-                if not ctx.audio_processor or not ctx.audio_processor.buffers:
-                    st.warning("수집된 오디오가 없습니다. 마이크 녹음 상태를 확인해주세요.")
-                else:
-                    # 오디오 파일을 메모리 내에서 직접 처리
-                    path = save_wav_from_buffers(ctx.audio_processor.buffers, sr=48000)
-                    if not path:
-                        st.warning("수집된 오디오가 없습니다. 마이크 녹음 상태를 확인해주세요.")
-                    else:
-                        with open(path, "rb") as f:
-                            audio_bytes = f.read()
-                        
-                        files = {"audio": ("input.wav", audio_bytes, "audio/wav")}
-                        data = {
-                            "engine": ENGINE,
-                            "language": LANG,
-                            "beam_size": int(BEAM),
-                            "topk": int(TOPK),
-                            "voice": VOICE,
-                        }
-                        t0 = time.time()
-                        res = requests.post(PIPELINE_URL, files=files, data=data, timeout=TIMEOUT)
-                        dt = time.time() - t0
-                        if res.ok:
-                            st.session_state.last_json = res.json()
-                            st.success(f"성공! (RTT {dt:.2f}s)")
-                        else:
-                            st.error(f"오류: {res.status_code} {res.text}")
-            except Exception as e:
-                st.error(f"전송 중 오류: {e}")
-
-    with c2:
-        if st.button("🧪 서버 상태 체크(/healthz)"):
-            try:
-                hres = requests.get(HEALTHZ_URL, timeout=10)
-                st.write(hres.json() if hres.ok else hres.text)
-            except Exception as e:
-                st.error(f"healthz 실패: {e}")
-
-# -----------------------------
-# 탭 2: 파일 업로드
-# -----------------------------
-with tabs[1]:
-    st.subheader("📁 파일 → /stt_search_tts")
-    up = st.file_uploader("오디오 파일 업로드 (wav/mp3/m4a 등)", type=["wav", "mp3", "m4a"])
-    if up and st.button("🚀 업로드 파일로 요청 보내기"):
-        try:
-            # 파일 객체에서 직접 바이트를 읽어옵니다.
-            audio_bytes = up.read()
+        for h in hits:
+            payload = h.payload
+            bonus = 0.0
             
-            # 읽어온 바이트 데이터를 전달합니다.
-            files = {"audio": (up.name, audio_bytes, up.type)}
+            tags_text = str(payload.get("tags", ""))
+            tag_list = [t.strip() for t in re.split(r"[,;\s]\s*", tags_text) if t]
+            for kw in query_keywords:
+                if kw in tag_list:
+                    bonus += 0.5
             
-            data = {
-                "engine": ENGINE,
-                "language": LANG,
-                "beam_size": int(BEAM),
-                "topk": int(TOPK),
-                "voice": VOICE,
-            }
-            t0 = time.time()
-            res = requests.post(PIPELINE_URL, files=files, data=data, timeout=TIMEOUT)
-            dt = time.time() - t0
-            if res.ok:
-                st.session_state.last_json = res.json()
-                st.success(f"성공! (RTT {dt:.2f}s)")
-            else:
-                st.error(f"오류: {res.status_code} {res.text}")
-        except Exception as e:
-            st.error(f"요청 실패: {e}")
+            service_name = str(payload.get("서비스명", ""))
+            for kw in query_keywords:
+                if kw and kw in service_name:
+                    bonus += 0.2
 
-# -----------------------------
-# 결과 표시/재생
-# -----------------------------
-st.divider()
-st.subheader("결과")
+            support = str(payload.get("지원내용", ""))
+            for kw in query_keywords:
+                if kw and kw in support:
+                    bonus += 0.05
+            
+            reranked.append({"hit": h, "final_score": (h.score or 0.0) + bonus})
 
-if st.session_state.last_json:
-    js = st.session_state.last_json
+        reranked.sort(key=lambda x: x["final_score"], reverse=True)
+        
+        return [item["hit"].payload for item in reranked[:top_k]]
 
-    st.markdown("### 📝 STT 결과")
-    st.write(js.get("stt", {}))
-
-    st.markdown("### 🔎 검색 결과")
-    st.write(js.get("search", {}))
-
-    st.markdown("### 🔊 합성 음성 (TTS)")
-    tts = js.get("tts", {})
-    b64 = tts.get("audio_mp3_b64")
-    if b64:
+class TTS:
+    async def synth_mp3_bytes(self, text: str, voice: str = DEFAULT_VOICE) -> bytes:
+        communicate = edge_tts.Communicate(text=text, voice=voice)
+        out_path = "_tmp_tts.mp3"
+        await communicate.save(out_path)
+        with open(out_path, "rb") as f:
+            data = f.read()
         try:
-            st.audio(base64.b64decode(b64), format="audio/mp3")
-        except Exception as e:
-            st.error(f"오디오 디코딩 오류: {e}")
+            os.remove(out_path)
+        except Exception:
+            pass
+        return data
+
+    def build_spoken_text(self, items, pause_ms=400):
+        parts = []
+        for i, r in enumerate(items[:MAX_READ], 1):
+            title = (r.get("서비스명") or "").strip()
+            summary = (r.get("지원내용") or "").strip()
+            if len(summary) > SUMMARY_CLIP:
+                summary = summary[:SUMMARY_CLIP].rstrip() + " ..."
+            parts.append(f"{i}번 정책은 {title} 입니다. 요약: {summary}")
+        if not parts:
+            return "적합한 정책을 찾지 못했습니다. 더 구체적으로 말씀해 주세요."
+        return " ".join(parts)
+
+# ======================
+# 2) FastAPI 앱 초기화
+# ======================
+app = FastAPI(title="정책 검색 서버", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True, 
+    allow_methods=["*"], 
+    allow_headers=["*"],
+)
+
+# ASR 서비스는 별도로 가정하고, 여기서는 클래스만 정의합니다.
+class FasterWhisperASR:
+    def __init__(self):
+        pass
+    def transcribe_bytes(self, data, language):
+        return "청년 주거 지원 정책을 찾고 있습니다", len(data) / 16000
+
+class OpenAIWhisperASR:
+    def __init__(self):
+        pass
+    def transcribe_bytes(self, data, language):
+        return "청년 주거 지원 정책을 찾고 있습니다", len(data) / 16000
+
+# ======================
+# 3) 서버 시작 시 초기화
+# ======================
+@app.on_event("startup")
+def startup_event():
+    global SEARCH, TTS_SERVICE, FW, OW
+    print("Initializing services...")
+    SEARCH = PolicySearch(POLICIES_PATH)
+    TTS_SERVICE = TTS()
+    FW = FasterWhisperASR()
+    OW = OpenAIWhisperASR()
+    print("Services initialized.")
+
+# ======================
+# 4) 엔드포인트
+# ======================
+@app.get("/healthz")
+def healthz():
+    ok = True
+    notes = []
+    if SEARCH.rows() == 0:
+        ok = False
+        notes.append("정책 CSV 비었거나 경로 불일치")
+    return {"ok": ok, "policy_rows": SEARCH.rows(), "policies_path": POLICIES_PATH, "notes": notes}
+
+@app.post("/stt_search_tts")
+async def stt_search_tts(
+    audio: UploadFile = File(...),
+    engine: str = Form(ENGINE_DEFAULT),
+    language: str = Form(LANGUAGE),
+    beam_size: int = Form(FW_BEAM),
+    topk: int = Form(3),
+    voice: str = Form(DEFAULT_VOICE),
+):
+    raw = await audio.read()
+    t0 = time.time()
+
+    if engine == "fw":
+        text, dur = FW.transcribe_bytes(raw, language=language)
     else:
-        st.info("오디오 데이터가 없습니다.")
+        text, dur = OW.transcribe_bytes(raw, language=language)
+    stt_time = time.time() - t0
 
-    with st.expander("읽어준 문장 확인"):
-        st.write(tts.get("spoken_text", ""))
-else:
-    st.info("아직 결과가 없습니다. 위 탭에서 마이크 녹음 또는 파일 업로드 후 전송하세요.")
+    results = SEARCH.search(text, topk=int(topk))
+    if results:
+        best = results[0]
+        spoken = f"추천 정책은 {best.get('서비스명','') or ''} 입니다. 요약: {best.get('지원내용','') or ''}"
+    else:
+        spoken = "적합한 정책을 찾지 못했습니다. 더 구체적으로 말씀해 주세요."
+
+    t1 = time.time()
+    mp3_bytes = await TTS_SERVICE.synth_mp3_bytes(spoken, voice=voice)
+    tts_time = time.time() - t1
+
+    audio_b64 = base64.b64encode(mp3_bytes).decode("utf-8")
+
+    return JSONResponse({
+        "stt": {"text": text, "engine": engine, "audio_sec": dur, "decode_s": stt_time, "language": language},
+        "search": {"query": text, "topk": int(topk), "results": results},
+        "tts": {"voice": voice, "spoken_text": spoken, "synthesis_s": tts_time, "audio_mp3_b64": audio_b64},
+        "pipeline_ms": int((time.time() - t0) * 1000)
+    })
