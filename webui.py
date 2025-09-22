@@ -18,7 +18,7 @@ st.title("음성 복지정책 도우미 (통합 서버 테스트 UI)")
 # 사이드바: 서버/옵션
 # -----------------------------
 st.sidebar.header("서버 & 옵션")
-API_BASE = st.sidebar.text_input("API Base URL", "http://165.132.46.88:30984")
+API_BASE = st.sidebar.text_input("API Base URL", "http://localhost:30989")
 ENGINE   = st.sidebar.selectbox("STT 엔진", ["fw", "ow"], index=0)
 LANG     = st.sidebar.text_input("언어", "ko")
 VOICE    = st.sidebar.selectbox("TTS 음성", ["ko-KR-SunHiNeural", "ko-KR-InJoonNeural"], index=0)
@@ -29,7 +29,7 @@ TIMEOUT  = st.sidebar.number_input("요청 타임아웃(sec)", min_value=5, max_
 PIPELINE_URL   = f"{API_BASE}/stt_search_tts"
 HEALTHZ_URL    = f"{API_BASE}/healthz"
 
-st.caption("TIP: 먼저 백엔드 서버를 켜세요 → `uvicorn app.server:app --port 30984 --reload`")
+st.caption("TIP: 먼저 백엔드 서버를 켜세요 → `uvicorn app.server:app --port 30989 --reload`")
 
 # -----------------------------
 # WebRTC 오디오 수집 (마이크)
@@ -79,11 +79,9 @@ with tabs[0]:
     with c1:
         if ctx and ctx.state.playing and st.button("🎧 현재 녹음분 전송"):
             try:
-                # 오디오 버퍼가 비어있는지 확인
                 if not ctx.audio_processor or not ctx.audio_processor.buffers:
                     st.warning("수집된 오디오가 없습니다. 마이크 녹음 상태를 확인해주세요.")
                 else:
-                    # 오디오 파일을 메모리 내에서 직접 처리
                     path = save_wav_from_buffers(ctx.audio_processor.buffers, sr=48000)
                     if not path:
                         st.warning("수집된 오디오가 없습니다. 마이크 녹음 상태를 확인해주세요.")
@@ -126,12 +124,8 @@ with tabs[1]:
     up = st.file_uploader("오디오 파일 업로드 (wav/mp3/m4a 등)", type=["wav", "mp3", "m4a"])
     if up and st.button("🚀 업로드 파일로 요청 보내기"):
         try:
-            # 파일 객체에서 직접 바이트를 읽어옵니다.
             audio_bytes = up.read()
-            
-            # 읽어온 바이트 데이터를 전달합니다.
             files = {"audio": (up.name, audio_bytes, up.type)}
-            
             data = {
                 "engine": ENGINE,
                 "language": LANG,
