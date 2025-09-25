@@ -17,7 +17,7 @@ st.title("음성 복지정책 도우미 (통합 서버 테스트 UI)")
 # 사이드바: 서버/옵션
 # -----------------------------
 st.sidebar.header("서버 & 옵션")
-API_BASE = st.sidebar.text_input("API Base URL", "http://165.132.46.88:30565")
+API_BASE = st.sidebar.text_input("API Base URL", "http://165.132.46.88:32374")
 ENGINE = st.sidebar.selectbox("STT 엔진", ["fw", "ow"], index=0)
 LANG = st.sidebar.text_input("언어", "ko")
 VOICE = st.sidebar.selectbox("TTS 음성", ["ko-KR-SunHiNeural", "ko-KR-InJoonNeural"], index=0)
@@ -25,10 +25,10 @@ TOPK = st.sidebar.number_input("검색 TopK", min_value=1, max_value=10, value=3
 BEAM = st.sidebar.number_input("Faster-Whisper beam_size", min_value=1, max_value=10, value=5)
 TIMEOUT = st.sidebar.number_input("요청 타임아웃(sec)", min_value=5, max_value=300, value=120)
 
-PIPELINE_URL = f"{API_BASE}/stt_search_tts"
+PIPELINE_URL = f"{API_BASE}/transcribe"
 HEALTHZ_URL = f"{API_BASE}/healthz"
 
-st.caption("TIP: 먼저 백엔드 서버를 켜세요 → `uvicorn app.server:app --port 30565 --reload`")
+st.caption("TIP: 먼저 백엔드 서버를 켜세요 → `uvicorn server:app --port 32374 --reload`")
 
 # -----------------------------
 # WebRTC 오디오 수집 (마이크)
@@ -154,20 +154,23 @@ if st.session_state.last_json:
 
     # STT 결과
     st.markdown("### 📝 STT 결과")
-    st.write(js.get("stt", {}))
-
-    # 검색 결과
-    st.markdown("### 🔎 검색 결과")
-    results = js.get("search", {}).get("results", [])
-    if results:
-        cols = st.columns(3)
-        for i, item in enumerate(results):
-            with cols[i % 3]:
-                with st.expander(f"**{item.get('서비스명', 'N/A')}**", expanded=True):
-                    st.write(f"**지원내용:** {item.get('지원내용', 'N/A')}")
-                    st.write(f"**태그:** {item.get('tags', 'N/A')}")
+        
+        # 응답 구조에 따라 유연하게 처리
+    if "stt" in js:
+        stt_data = js.get("stt", {})
+        text = stt_data.get("text", "음성 인식 결과가 없습니다")
     else:
-        st.info("검색 결과가 없습니다.")
+        # /transcribe 엔드포인트의 직접 응답 구조 처리
+        text = js.get("text", "음성 인식 결과가 없습니다")
+        stt_data = {
+            "engine": js.get("engine", "N/A"),
+            "audio_sec": js.get("audio_sec", 0),
+            "decode_s": js.get("decode_s", 0),
+            "language": js.get("language", "N/A")
+        }
+        
+    # STT 결과 표시
+    st.write(f"**인식된 텍스트:** {text}")
 
     # 합성 음성
     st.markdown("### 🔊 합성 음성 (TTS)")
