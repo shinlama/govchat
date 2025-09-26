@@ -17,7 +17,8 @@ st.title("음성 복지정책 도우미 (통합 서버 테스트 UI)")
 # 사이드바: 서버/옵션
 # -----------------------------
 st.sidebar.header("서버 & 옵션")
-API_BASE = st.sidebar.text_input("API Base URL", "http://165.132.46.88:32374")
+# 배포된 서버 주소로 기본값 설정
+API_BASE = st.sidebar.text_input("API Base URL", "http://165.132.46.88:32374") 
 ENGINE = st.sidebar.selectbox("STT 엔진", ["fw", "ow"], index=0)
 LANG = st.sidebar.text_input("언어", "ko")
 VOICE = st.sidebar.selectbox("TTS 음성", ["ko-KR-SunHiNeural", "ko-KR-InJoonNeural"], index=0)
@@ -25,10 +26,11 @@ TOPK = st.sidebar.number_input("검색 TopK", min_value=1, max_value=10, value=3
 BEAM = st.sidebar.number_input("Faster-Whisper beam_size", min_value=1, max_value=10, value=5)
 TIMEOUT = st.sidebar.number_input("요청 타임아웃(sec)", min_value=5, max_value=300, value=120)
 
-PIPELINE_URL = f"{API_BASE}/transcribe"
+# STT, 검색, TTS 통합 파이프라인 엔드포인트 사용
+PIPELINE_URL = f"{API_BASE}/stt_search_tts"
 HEALTHZ_URL = f"{API_BASE}/healthz"
 
-st.caption("TIP: 먼저 백엔드 서버를 켜세요 → `uvicorn server:app --port 32374 --reload`")
+st.caption("TIP: 백엔드 서버는 `http://165.132.46.88:32374`에 **/stt_search_tts** 엔드포인트가 배포되어 있어야 합니다.")
 
 # -----------------------------
 # WebRTC 오디오 수집 (마이크)
@@ -38,7 +40,6 @@ class AudioProcessor(AudioProcessorBase):
         self.buffers = []
         self.sr = 48000
     def recv_audio(self, frame: av.AudioFrame) -> av.AudioFrame:
-        # float32 PCM, shape = (channels, samples)
         self.buffers.append(frame.to_ndarray())
         return frame
 
@@ -154,37 +155,56 @@ if st.session_state.last_json:
 
     # STT 결과
     st.markdown("### 📝 STT 결과")
-        
-        # 응답 구조에 따라 유연하게 처리
-    if "stt" in js:
-        stt_data = js.get("stt", {})
-        text = stt_data.get("text", "음성 인식 결과가 없습니다")
+    st.write(js.get("stt", {}))
+
+    # 검색 결과
+    st.markdown("### 🔎 검색 결과")
+    # 서버 응답 구조: js['search']['results']
+    results = js.get("search", {}).get("results", []) 
+    if results:
+        cols = st.columns(3)
+        for i, item in enumerate(results):
+            # 검색 결과에서 필요한 필드를 안전하게 추출
+            service_name = item.get('service_name') or item.get('서비스명', 'N/A')
+            support_content = item.get('support') or item.get('지원내용', 'N/A')
+            tags = item.get('tags', 'N/A')
+            
+            # 태그가 리스트 형태일 경우 보기 좋게 변환
+            if isinstance(tags, list):
+                tags_text = ", ".join(t.strip("['\"") for t in tags)
+            else:
+                tags_text = tags.strip("['\"")
+
+            with cols[i % 3]:
+                # 서비스명과 랭크를 제목으로 사용
+                title_text = f"{i+1}. {service_name}"
+                with st.expander(f"**{title_text}**", expanded=True):
+                    # 지원내용과 태그가 성공적으로 표시됨
+                    st.markdown(f"**지원내용:** {support_content}")
+                    st.markdown(f"**태그:** {tags_text}")
     else:
-        # /transcribe 엔드포인트의 직접 응답 구조 처리
-        text = js.get("text", "음성 인식 결과가 없습니다")
-        stt_data = {
-            "engine": js.get("engine", "N/A"),
-            "audio_sec": js.get("audio_sec", 0),
-            "decode_s": js.get("decode_s", 0),
-            "language": js.get("language", "N/A")
-        }
-        
-    # STT 결과 표시
-    st.write(f"**인식된 텍스트:** {text}")
+        st.info("검색 결과가 없습니다.")
 
     # 합성 음성
     st.markdown("### 🔊 합성 음성 (TTS)")
     tts = js.get("tts", {})
     b64 = tts.get("audio_mp3_b64")
+    
+    # TTS 결과에서 'spoken_text' 필드를 추출하여 읽어줄 문장 확인
+    spoken_text = tts.get("spoken_text") or js.get("summary", "읽어줄 문장이 없습니다.")
+
     if b64:
+        # Base64 데이터가 있을 경우에만 재생 시도
         try:
             st.audio(base64.b64decode(b64), format="audio/mp3")
         except Exception as e:
             st.error(f"오디오 디코딩 오류: {e}")
     else:
-        st.info("오디오 데이터가 없습니다.")
+        # 오디오 바이트가 비어있을 경우, 서버 측 TTS 오류를 의심
+        st.error("오디오 데이터가 서버에서 생성되지 않았습니다. (서버 측 TTS 오류 가능성)")
 
     with st.expander("읽어준 문장 확인"):
-        st.write(tts.get("spoken_text", ""))
+        # spoken_text 필드를 출력
+        st.write(spoken_text)
 else:
     st.info("아직 결과가 없습니다. 위 탭에서 마이크 녹음 또는 파일 업로드 후 전송하세요.")

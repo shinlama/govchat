@@ -5,7 +5,7 @@ import os
 import asyncio
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from rich.console import Console
 
@@ -131,14 +131,18 @@ class PolicySearch:
 
 class EdgeTTS:
     async def synth(self, text: str, voice: str = DEFAULT_VOICE) -> bytes:
-        communicate = edge_tts.Communicate(text=text, voice=voice)
-        audio_chunks = []
-        async for chunk in communicate.stream():
-            if chunk.get("type") == "audio":
-                data = chunk.get("data") or chunk.get("content")
-                if data:
-                    audio_chunks.append(data)
-        return b"".join(audio_chunks)
+        try:
+            communicate = edge_tts.Communicate(text=text, voice=voice)
+            audio_chunks = []
+            async for chunk in communicate.stream():
+                if chunk.get("type") == "audio":
+                    data = chunk.get("data") or chunk.get("content")
+                    if data:
+                        audio_chunks.append(data)
+            return b"".join(audio_chunks)
+        except Exception as e:
+            console.print(f"[bold red]EdgeTTS 합성 오류: {e}[/]")
+            return b"" # 오류 발생 시 빈 바이트 반환하여 서버 다운 방지
 
 def to_f32_16k_mono(audio_bytes: bytes) -> np.ndarray:
     with io.BytesIO(audio_bytes) as f:
