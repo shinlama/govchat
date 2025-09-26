@@ -188,20 +188,31 @@ if st.session_state.last_json:
     # 합성 음성
     st.markdown("### 🔊 합성 음성 (TTS)")
     tts = js.get("tts", {})
-    b64 = tts.get("audio_mp3_b64")
-    
-    # TTS 결과에서 'spoken_text' 필드를 추출하여 읽어줄 문장 확인
+    # 서버별 키 호환: audio_mp3_b64 또는 mp3_b64
+    b64 = tts.get("audio_mp3_b64") or tts.get("mp3_b64")
+
     spoken_text = tts.get("spoken_text") or js.get("summary", "읽어줄 문장이 없습니다.")
 
+    def safe_b64_decode(s: str) -> bytes:
+        if not isinstance(s, str):
+            raise ValueError("base64 문자열이 아님")
+        clean = s.strip().replace("\n", "").replace("\r", "")
+        # 공백이 '+'로 잘려온 경우 보정
+        clean = clean.replace(" ", "+")
+        # 패딩 보정
+        pad = (-len(clean)) % 4
+        if pad:
+            clean += "=" * pad
+        return base64.b64decode(clean)
+
     if b64:
-        # Base64 데이터가 있을 경우에만 재생 시도
         try:
-            st.audio(base64.b64decode(b64), format="audio/mp3")
+            audio_bytes = safe_b64_decode(b64)
+            st.audio(audio_bytes, format="audio/mp3")
         except Exception as e:
             st.error(f"오디오 디코딩 오류: {e}")
     else:
-        # 오디오 바이트가 비어있을 경우, 서버 측 TTS 오류를 의심
-        st.error("오디오 데이터가 서버에서 생성되지 않았습니다. (서버 측 TTS 오류 가능성)")
+        st.error("오디오 데이터가 서버에서 생성되지 않았습니다. (서버 측 TTS 키(audio_mp3_b64/mp3_b64) 확인 필요)")
 
     with st.expander("읽어준 문장 확인"):
         # spoken_text 필드를 출력
