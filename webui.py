@@ -109,9 +109,9 @@ def generate_field_summary(service_data, field_name):
         field_label = field_labels.get(field_name, field_name)
         
         prompt = f"""
-다음 {field_label} 정보를 간결하고 이해하기 쉽게 요약해주세요:
+다음 정보를 간결하고 이해하기 쉽게 요약해주세요:
 
-{field_label}: {field_value}
+{field_value}
 
 요구사항:
 1. 핵심 내용만 간결하게 정리
