@@ -136,6 +136,49 @@ def generate_field_summary(service_data, field_name):
     except Exception as e:
         return None
 
+def generate_tts_summary(service_data):
+    """TTS용 4줄 요약 생성"""
+    if not OPENAI_API_KEY:
+        return None
+    
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        
+        prompt = f"""
+다음 정책 정보를 4줄 이내의 자연스러운 문장으로 요약해주세요:
+
+서비스명: {service_data.get('service_name', 'N/A')}
+지원내용: {service_data.get('support', 'N/A')}
+신청대상: {service_data.get('target_beneficiaries', 'N/A')}
+신청방법: {service_data.get('application_method', 'N/A')}
+필요서류: {service_data.get('required_documents', 'N/A')}
+문의처: {service_data.get('contact', 'N/A')}
+
+요구사항:
+1. "추천하는 정책은 [정책명]입니다."로 시작
+2. "대상은 [신청대상]이며"로 이어짐
+3. "신청 방법은 [신청방법]이고"로 이어짐
+4. "어떠한 서류를 통해 어떻게 신청하면 됩니다. 문의처는 [문의처]입니다."로 마무리
+5. 4줄 이내의 자연스러운 문장으로 작성
+6. 음성으로 읽기 좋게 작성
+
+요약:
+"""
+        
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "당신은 정책 정보를 음성으로 읽기 좋은 자연스러운 문장으로 요약하는 전문가입니다."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=200,
+            temperature=0.7
+        )
+        
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return None
+
 def display_policy_info(service_data, index):
     """정책 정보를 Streamlit UI 스타일로 표시"""
     service_name = service_data.get('service_name', 'N/A')
@@ -211,13 +254,27 @@ class AudioProcessor(AudioProcessorBase):
 
 def save_wav_from_buffers(buffers, sr=48000, path="tmp_input.wav"):
     if not buffers:
+        st.write("🔍 디버깅: buffers가 None 또는 빈 리스트입니다.")
         return None
-    data = np.concatenate(buffers, axis=1)
-    if data.ndim == 2 and data.shape[0] > 1:
-        data = data.mean(axis=0, keepdims=True)  # stereo -> mono
-    data = (data.squeeze() * 32767).astype("int16")
-    write(path, sr, data)
-    return path
+    
+    try:
+        st.write(f"🔍 디버깅: buffers 길이 = {len(buffers)}")
+        data = np.concatenate(buffers, axis=1)
+        st.write(f"🔍 디버깅: concatenated data shape = {data.shape}")
+        
+        if data.ndim == 2 and data.shape[0] > 1:
+            data = data.mean(axis=0, keepdims=True)  # stereo -> mono
+            st.write(f"🔍 디버깅: mono 변환 후 shape = {data.shape}")
+        
+        data = (data.squeeze() * 32767).astype("int16")
+        st.write(f"🔍 디버깅: 최종 data shape = {data.shape}, dtype = {data.dtype}")
+        
+        write(path, sr, data)
+        st.write(f"🔍 디버깅: 파일 저장 완료 - {path}")
+        return path
+    except Exception as e:
+        st.error(f"🔍 디버깅: 오디오 처리 중 오류 - {e}")
+        return None
 
 tabs = st.tabs(["🎙️ 마이크 녹음", "📁 파일 업로드"])
 
@@ -246,10 +303,19 @@ with tabs[0]:
         if ctx and ctx.state.playing and st.button("🎧 현재 녹음분 전송"):
             try:
                 if ctx.audio_processor:
-                    path = save_wav_from_buffers(ctx.audio_processor.buffers, sr=48000)
-                    if not path:
-                        st.warning("수집된 오디오가 없습니다. 마이크 녹음 상태를 확인해주세요.")
+                    # 디버깅 정보 추가
+                    buffer_count = len(ctx.audio_processor.buffers) if ctx.audio_processor.buffers else 0
+                    st.write(f"🔍 디버깅: 버퍼 개수 = {buffer_count}")
+                    
+                    if buffer_count == 0:
+                        st.warning("⚠️ 오디오 버퍼가 비어있습니다. 마이크 권한을 확인하고 다시 녹음해주세요.")
                     else:
+                        path = save_wav_from_buffers(ctx.audio_processor.buffers, sr=48000)
+                        if not path:
+                            st.warning("수집된 오디오가 없습니다. 마이크 녹음 상태를 확인해주세요.")
+                        else:
+                            st.success(f"✅ 오디오 파일 생성 완료: {path}")
+                            
                         with open(path, "rb") as f:
                             files = {"audio": ("input.wav", f, "audio/wav")}
                             data = {
@@ -259,10 +325,26 @@ with tabs[0]:
                                 "topk": int(TOPK),
                                 "voice": VOICE,
                             }
+                            
+                            # 1단계: 검색 결과 받기
                             st.spinner("서버에 요청 중...")
                             t0 = time.time()
                             res = requests.post(PIPELINE_URL, files=files, data=data, timeout=TIMEOUT)
                             dt = time.time() - t0
+                            
+                            # 2단계: GPT 요약 생성 후 TTS 요청
+                            if res.ok and OPENAI_API_KEY:
+                                search_results = res.json().get("search", {}).get("results", [])
+                                if search_results:
+                                    with st.spinner("GPT 요약 생성 중..."):
+                                        tts_summary = generate_tts_summary(search_results[0])
+                                        if tts_summary:
+                                            # GPT 요약 텍스트로 TTS 요청
+                                            data["tts_text"] = tts_summary
+                                            st.spinner("GPT 요약으로 음성 생성 중...")
+                                            t0 = time.time()
+                                            res = requests.post(PIPELINE_URL, files=files, data=data, timeout=TIMEOUT)
+                                            dt = time.time() - t0
                         if res.ok:
                             st.session_state.last_json = res.json()
                             st.success(f"성공! (RTT {dt:.2f}s)")
@@ -298,10 +380,12 @@ with tabs[1]:
                 "topk": int(TOPK),
                 "voice": VOICE,
             }
+            
             st.spinner("서버에 요청 중...")
             t0 = time.time()
             res = requests.post(PIPELINE_URL, files=files, data=data, timeout=TIMEOUT)
             dt = time.time() - t0
+                
             if res.ok:
                 st.session_state.last_json = res.json()
                 st.success(f"성공! (RTT {dt:.2f}s)")
@@ -349,7 +433,13 @@ if st.session_state.last_json:
     # 서버별 키 호환: audio_mp3_b64 또는 mp3_b64
     b64 = tts.get("audio_mp3_b64") or tts.get("mp3_b64")
 
-    spoken_text = tts.get("spoken_text") or js.get("summary", "읽어줄 문장이 없습니다.")
+    # GPT API로 4줄 요약 생성
+    if results and OPENAI_API_KEY:
+        with st.spinner("음성용 정책 요약 생성 중..."):
+            tts_summary = generate_tts_summary(results[0])  # 첫 번째 결과 사용
+            spoken_text = tts_summary if tts_summary else tts.get("spoken_text") or js.get("summary", "읽어줄 문장이 없습니다.")
+    else:
+        spoken_text = tts.get("spoken_text") or js.get("summary", "읽어줄 문장이 없습니다.")
 
     def safe_b64_decode(s: str) -> bytes:
         if not isinstance(s, str):
