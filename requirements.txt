@@ -16,5 +16,4 @@ openai
 uuid
 tqdm
 rich
-st_audiorec
 python-dotenv
