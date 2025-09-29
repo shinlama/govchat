@@ -30,7 +30,7 @@ TIMEOUT = st.sidebar.number_input("요청 타임아웃(sec)", min_value=5, max_v
 
 # OpenAI API Key 설정
 load_dotenv()
-OPENAI_API_KEY=st.secrets["OPENAI_API_KEY"]
+OPENAI_API_KEY=os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 # STT, 검색, TTS 통합 파이프라인 엔드포인트 사용
 PIPELINE_URL = f"{API_BASE}/stt_search_tts"
