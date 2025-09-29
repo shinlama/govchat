@@ -4,15 +4,16 @@ import time
 import requests
 import numpy as np
 import streamlit as st
+from dotenv import load_dotenv
 from openai import OpenAI
 
-# WebRTC로 마이크 녹음
-import av
-from scipy.io.wavfile import write
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
+# streamlit-audio-recorder로 마이크 녹음
+from streamlit_mic_recorder import mic_recorder
+import tempfile
+import os
 
 st.set_page_config(page_title="통합 STT→정책검색→TTS", layout="centered")
-st.title("음성 복지정책 도우미 (통합 서버 테스트 UI)")
+st.title("👩🏻‍💼 음성 복지정책 도우미")
 
 # -----------------------------
 # 사이드바: 서버/옵션
@@ -28,13 +29,11 @@ BEAM = st.sidebar.number_input("Faster-Whisper beam_size", min_value=1, max_valu
 TIMEOUT = st.sidebar.number_input("요청 타임아웃(sec)", min_value=5, max_value=300, value=120)
 
 # OpenAI API Key 설정
-OPENAI_API_KEY = st.sidebar.text_input("OpenAI API Key", type="password")
-
+load_dotenv()
+OPENAI_API_KEY=os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
 # STT, 검색, TTS 통합 파이프라인 엔드포인트 사용
 PIPELINE_URL = f"{API_BASE}/stt_search_tts"
-HEALTHZ_URL = f"{API_BASE}/healthz"
-
-st.caption("TIP: 백엔드 서버는 `http://165.132.46.88:31180`에 **/stt_search_tts** 엔드포인트가 배포되어 있어야 합니다.")
 
 # -----------------------------
 # OpenAI를 사용한 자연스러운 문장 생성 함수
@@ -155,10 +154,11 @@ def generate_tts_summary(service_data):
 문의처: {service_data.get('contact', 'N/A')}
 
 요구사항:
+0. []안에는 정책 정보 채워넣기
 1. "추천하는 정책은 [정책명]입니다."로 시작
 2. "대상은 [신청대상]이며"로 이어짐
 3. "신청 방법은 [신청방법]이고"로 이어짐
-4. "어떠한 서류를 통해 어떻게 신청하면 됩니다. 문의처는 [문의처]입니다."로 마무리
+4. "[필요서류]를 통해 [신청방법]으로 신청하면 됩니다. 문의처는 [문의처]입니다."로 마무리
 5. 4줄 이내의 자연스러운 문장으로 작성
 6. 음성으로 읽기 좋게 작성
 
@@ -242,173 +242,149 @@ def display_policy_info(service_data, index):
         st.markdown("---")
 
 # -----------------------------
-# WebRTC 오디오 수집 (마이크)
+# streamlit-audio-recorder 기반 오디오 수집
 # -----------------------------
-class AudioProcessor(AudioProcessorBase):
-    def __init__(self) -> None:
-        self.buffers = []
-        self.sr = 48000
-    def recv_audio(self, frame: av.AudioFrame) -> av.AudioFrame:
-        self.buffers.append(frame.to_ndarray())
-        return frame
-
-def save_wav_from_buffers(buffers, sr=48000, path="tmp_input.wav"):
-    if not buffers:
-        st.write("🔍 디버깅: buffers가 None 또는 빈 리스트입니다.")
+def save_audio_to_temp_file(audio_data, filename="tmp_input.wav"):
+    """오디오 데이터를 임시 파일로 저장"""
+    if audio_data is None:
         return None
     
     try:
-        st.write(f"🔍 디버깅: buffers 길이 = {len(buffers)}")
-        data = np.concatenate(buffers, axis=1)
-        st.write(f"🔍 디버깅: concatenated data shape = {data.shape}")
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        temp_file.write(audio_data)
+        temp_file.close()
         
-        if data.ndim == 2 and data.shape[0] > 1:
-            data = data.mean(axis=0, keepdims=True)  # stereo -> mono
-            st.write(f"🔍 디버깅: mono 변환 후 shape = {data.shape}")
-        
-        data = (data.squeeze() * 32767).astype("int16")
-        st.write(f"🔍 디버깅: 최종 data shape = {data.shape}, dtype = {data.dtype}")
-        
-        write(path, sr, data)
-        st.write(f"🔍 디버깅: 파일 저장 완료 - {path}")
-        return path
+        return temp_file.name
     except Exception as e:
-        st.error(f"🔍 디버깅: 오디오 처리 중 오류 - {e}")
+        st.error(f"오디오 파일 저장 중 오류: {e}")
         return None
-
-tabs = st.tabs(["🎙️ 마이크 녹음", "📁 파일 업로드"])
 
 # 상태 저장
 if "last_json" not in st.session_state:
     st.session_state.last_json = None
+if "recorded_audio" not in st.session_state:
+    st.session_state.recorded_audio = None
 
 # -----------------------------
-# 탭 1: 마이크 녹음
+# 마이크 녹음 (streamlit-audio-recorder 사용)
 # -----------------------------
-with tabs[0]:
-    st.subheader("🎙️ 마이크 → /stt_search_tts")
-    st.markdown("1) **Start** 눌러 말하고 → 2) **🎧 현재 녹음분 전송**")
+st.subheader("상황에 맞는 복지 정책을 찾아 드려요!")
+st.markdown("**Start Recording 버튼**을 클릭하여 말하고 **Stop 버튼**으로 중단하면 자동 검색됩니다!")
 
-    ctx = webrtc_streamer(
-        key="stt-pipeline",
-        mode=WebRtcMode.SENDONLY,
-        audio_receiver_size=1024,
-        media_stream_constraints={"audio": True, "video": False},
-        async_processing=False,
-        audio_processor_factory=AudioProcessor,
-    )
+# streamlit-audio-recorder 사용
+wav_audio_data = mic_recorder(
+    start_prompt="Start Recording",
+    stop_prompt="Stop",
+    just_once=True,
+    use_container_width=True,
+    key="recorder"
+)
 
-    c1, c2 = st.columns(2)
-    with c1:
-        if ctx and ctx.state.playing and st.button("🎧 현재 녹음분 전송"):
-            try:
-                if ctx.audio_processor:
-                    # 디버깅 정보 추가
-                    buffer_count = len(ctx.audio_processor.buffers) if ctx.audio_processor.buffers else 0
-                    st.write(f"🔍 디버깅: 버퍼 개수 = {buffer_count}")
-                    
-                    if buffer_count == 0:
-                        st.warning("⚠️ 오디오 버퍼가 비어있습니다. 마이크 권한을 확인하고 다시 녹음해주세요.")
-                    else:
-                        path = save_wav_from_buffers(ctx.audio_processor.buffers, sr=48000)
-                        if not path:
-                            st.warning("수집된 오디오가 없습니다. 마이크 녹음 상태를 확인해주세요.")
-                        else:
-                            st.success(f"✅ 오디오 파일 생성 완료: {path}")
-                            
-                        with open(path, "rb") as f:
-                            files = {"audio": ("input.wav", f, "audio/wav")}
-                            data = {
-                                "engine": ENGINE,
-                                "language": LANG,
-                                "beam_size": int(BEAM),
-                                "topk": int(TOPK),
-                                "voice": VOICE,
-                            }
-                            
-                            # 1단계: 검색 결과 받기
-                            st.spinner("서버에 요청 중...")
-                            t0 = time.time()
-                            res = requests.post(PIPELINE_URL, files=files, data=data, timeout=TIMEOUT)
-                            dt = time.time() - t0
-                            
-                            # 2단계: GPT 요약 생성 후 TTS 요청
-                            if res.ok and OPENAI_API_KEY:
-                                search_results = res.json().get("search", {}).get("results", [])
-                                if search_results:
-                                    with st.spinner("GPT 요약 생성 중..."):
-                                        tts_summary = generate_tts_summary(search_results[0])
-                                        if tts_summary:
-                                            # GPT 요약 텍스트로 TTS 요청
-                                            data["tts_text"] = tts_summary
-                                            st.spinner("GPT 요약으로 음성 생성 중...")
-                                            t0 = time.time()
-                                            res = requests.post(PIPELINE_URL, files=files, data=data, timeout=TIMEOUT)
-                                            dt = time.time() - t0
-                        if res.ok:
-                            st.session_state.last_json = res.json()
-                            st.success(f"성공! (RTT {dt:.2f}s)")
-                        else:
-                            st.error(f"오류: {res.status_code} {res.text}")
-                else:
-                    st.error("오디오 프로세서가 준비되지 않았습니다.")
-            except Exception as e:
-                st.error(f"전송 중 오류: {e}")
-
-    with c2:
-        if st.button("🧪 서버 상태 체크(/healthz)"):
-            try:
-                hres = requests.get(HEALTHZ_URL, timeout=10)
-                st.write(hres.json() if hres.ok else hres.text)
-            except Exception as e:
-                st.error(f"healthz 실패: {e}")
-
-# -----------------------------
-# 탭 2: 파일 업로드
-# -----------------------------
-with tabs[1]:
-    st.subheader("📁 파일 → /stt_search_tts")
-    up = st.file_uploader("오디오 파일 업로드 (wav/mp3/m4a 등)", type=["wav", "mp3", "m4a"])
-    if up and st.button("🚀 업로드 파일로 요청 보내기"):
+# 녹음된 오디오가 있으면 자동으로 서버에 전송
+if wav_audio_data and "bytes" in wav_audio_data:
+    if st.session_state.recorded_audio != wav_audio_data["bytes"]:
+        st.session_state.recorded_audio = wav_audio_data["bytes"]
+        
+        # 자동으로 서버에 전송
         try:
-            audio_bytes = up.read()
-            files = {"audio": (up.name, audio_bytes, up.type)}
-            data = {
-                "engine": ENGINE,
-                "language": LANG,
-                "beam_size": int(BEAM),
-                "topk": int(TOPK),
-                "voice": VOICE,
-            }
-            
-            st.spinner("서버에 요청 중...")
-            t0 = time.time()
-            res = requests.post(PIPELINE_URL, files=files, data=data, timeout=TIMEOUT)
-            dt = time.time() - t0
-                
-            if res.ok:
-                st.session_state.last_json = res.json()
-                st.success(f"성공! (RTT {dt:.2f}s)")
+            # 임시 파일로 저장
+            path = save_audio_to_temp_file(st.session_state.recorded_audio)
+            if not path:
+                st.warning("오디오 파일 생성에 실패했습니다.")
             else:
-                st.error(f"오류: {res.status_code} {res.text}")
+                with open(path, "rb") as f:
+                    files = {"audio": ("input.wav", f, "audio/wav")}
+                    data = {
+                        "engine": ENGINE,
+                        "language": LANG,
+                        "beam_size": int(BEAM),
+                        "topk": int(TOPK),
+                        "voice": VOICE,
+                    }
+                    
+                    # 1단계: 검색 결과 받기
+                    with st.spinner("서버에 요청 중..."):
+                        t0 = time.time()
+                        res = requests.post(PIPELINE_URL, files=files, data=data, timeout=TIMEOUT)
+                        dt = time.time() - t0
+                    
+                    # 2단계: GPT 요약 생성 후 TTS 요청
+                    if res.ok and OPENAI_API_KEY:
+                        search_results = res.json().get("search", {}).get("results", [])
+                        if search_results:
+                            with st.spinner("GPT 요약 생성 중..."):
+                                tts_summary = generate_tts_summary(search_results[0])
+                                if tts_summary:
+                                    # GPT 요약 텍스트로 /synthesize 엔드포인트에 TTS 요청
+                                    synthesize_url = f"{API_BASE}/synthesize"
+                                    tts_data = {
+                                        "text": tts_summary,
+                                        "voice": VOICE,
+                                        "rate": "+0%",
+                                        "volume": "+0%",
+                                        "pitch": "+0Hz"
+                                    }
+                                    
+                                    with st.spinner("GPT 요약으로 음성 생성 중..."):
+                                        t0 = time.time()
+                                        tts_res = requests.post(synthesize_url, json=tts_data, timeout=TIMEOUT)
+                                        dt = time.time() - t0
+                                        
+                                        if tts_res.ok:
+                                            # TTS 결과를 기존 응답에 병합
+                                            tts_result = tts_res.json()
+                                            response_data = res.json()
+                                            if "tts" not in response_data:
+                                                response_data["tts"] = {}
+                                            response_data["tts"]["audio_mp3_b64"] = tts_result.get("mp3_b64", "")
+                                            response_data["tts"]["spoken_text"] = tts_summary
+                                            response_data["tts"]["voice"] = VOICE
+                                            response_data["tts"]["synthesis_s"] = dt
+                                            
+                                            # 세션에 병합된 결과 저장
+                                            st.session_state.last_json = response_data
+                                        else:
+                                            st.warning(f"TTS 생성 실패: {tts_res.status_code}")
+                                            # 기존 결과 그대로 사용
+                                            st.session_state.last_json = res.json()
+                    
+                    if res.ok:
+                        # GPT TTS가 처리되지 않은 경우에만 기본 결과 저장
+                        if not (OPENAI_API_KEY and res.json().get("search", {}).get("results", [])):
+                            st.session_state.last_json = res.json()
+                        
+                        # 임시 파일 정리
+                        try:
+                            os.remove(path)
+                        except:
+                            pass
+                    else:
+                        st.error(f"오류: {res.status_code} {res.text}")
+                        
         except Exception as e:
-            st.error(f"요청 실패: {e}")
+            st.error(f"전송 중 오류: {e}")
 
 # -----------------------------
 # 결과 표시/재생
 # -----------------------------
 st.divider()
-st.subheader("결과")
 
 if st.session_state.last_json:
     js = st.session_state.last_json
 
     # STT 결과
-    st.markdown("### 📝 STT 결과")
-    st.write(js.get("stt", {}))
+    st.markdown("### 📝 인식된 음성")
+    stt_data = js.get("stt", {})
+    recognized_text = stt_data.get("text", "음성을 인식하지 못했습니다.")
+    
+    # 인식된 텍스트를 깔끔하게 표시
+    if recognized_text and recognized_text.strip():
+        st.markdown(f'> "{recognized_text}"')
+    else:
+        st.info("음성을 인식하지 못했습니다.")
 
     # 검색 결과
-    st.markdown("### 🔎 검색 결과")
+    st.markdown("### 🔎 지원 정책 검색 결과")
     # 서버 응답 구조: js['search']['results'] 
     results = js.get("search", {}).get("results", []) 
     if results:
@@ -428,7 +404,7 @@ if st.session_state.last_json:
         st.info("검색 결과가 없습니다.")
 
     # 합성 음성
-    st.markdown("### 🔊 합성 음성 (TTS)")
+    st.markdown("### 🔊 음성 지원")
     tts = js.get("tts", {})
     # 서버별 키 호환: audio_mp3_b64 또는 mp3_b64
     b64 = tts.get("audio_mp3_b64") or tts.get("mp3_b64")
@@ -456,14 +432,18 @@ if st.session_state.last_json:
     if b64:
         try:
             audio_bytes = safe_b64_decode(b64)
-            st.audio(audio_bytes, format="audio/mp3")
+            # Base64 인코딩된 오디오를 HTML audio 태그로 자동 재생
+            audio_base64 = base64.b64encode(audio_bytes).decode()
+            audio_html = f"""
+            <audio controls autoplay>
+                <source src="data:audio/mp3;base64,{audio_base64}" type="audio/mp3">
+                Your browser does not support the audio element.
+            </audio>
+            """
+            st.markdown(audio_html, unsafe_allow_html=True)
         except Exception as e:
             st.error(f"오디오 디코딩 오류: {e}")
     else:
         st.error("오디오 데이터가 서버에서 생성되지 않았습니다. (서버 측 TTS 키(audio_mp3_b64/mp3_b64) 확인 필요)")
-
-    with st.expander("읽어준 문장 확인"):
-        # spoken_text 필드를 출력
-        st.write(spoken_text)
 else:
     st.info("아직 결과가 없습니다. 위 탭에서 마이크 녹음 또는 파일 업로드 후 전송하세요.")
